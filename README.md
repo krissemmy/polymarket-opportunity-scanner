@@ -10,6 +10,8 @@ Read-only Next.js app that scans public Polymarket markets for complete-set pric
 - Zero opportunities is a valid result, not a bug. The UI is designed to say that clearly.
 - The default view shows positive-edge opportunities only and hides extreme long-shot markets by default to reduce noise.
 
+**Stack:** Next.js 15 (App Router, Node runtime), React 19, TypeScript. Zero runtime dependencies beyond the framework. No database, no cron, no secrets.
+
 ## Why this is useful
 
 Polymarket exposes enough public data to answer a narrow but useful question:
@@ -93,13 +95,23 @@ Filters used to avoid junk and noise:
 
 - non-binary markets are dropped
 - markets missing token IDs are dropped
-- books missing bids or asks are dropped
-- invalid quotes are dropped
-- very wide spreads are dropped
-- thin top-of-book liquidity is dropped
-- weak negative-edge candidates are dropped as noise
-- extreme long-shot markets are hidden by default in the UI
-- positive-edge-only view is on by default
+- books missing bids or asks are dropped (server side)
+- invalid quotes and crossed books are dropped (server side)
+- spreads wider than 25c on either side are dropped (`POLYMARKET_MAX_SPREAD`)
+- markets with < 50 sets at the dominant-side top of book are dropped (`POLYMARKET_MIN_TOP_LIQUIDITY`)
+- weak negative-edge candidates below -0.5% from parity are dropped as noise (`POLYMARKET_MIN_EDGE`)
+- extreme long-shot markets are hidden by default in the UI: any quote priced ≤ 2c or ≥ 98c counts as long-shot because the arithmetic edge is dominated by tick noise, not real mispricing
+- positive-edge-only view is on by default; both UI toggles are persisted in `localStorage`
+
+## UI behaviour worth calling out
+
+- Summary cards show `—` when there is no positive edge to report. They never surface negative "bests".
+- Confidence is capped at LOW for any non-opportunity. A tight book with zero edge cannot look HIGH confidence.
+- Each market question links to its Polymarket event page so you can sanity-check the source book.
+- Every row has an expandable reasoning drawer with the exact formulas and the key-metric grid.
+- If the upstream Polymarket fetch fails, the API falls back to the last cached snapshot and the UI shows a "serving last good snapshot (Ns old)" banner instead of going blank.
+- The error banner has a Retry button that triggers an immediate silent refresh.
+- Skeleton rows render on first paint instead of a blank table.
 
 ## Product decisions / tradeoffs
 
@@ -136,14 +148,16 @@ npm run typecheck
 npm run build
 ```
 
-Optional tuning knobs:
+Optional tuning knobs (all have sensible defaults):
 
-- `POLYMARKET_MARKET_LIMIT`
-- `POLYMARKET_CACHE_TTL_MS`
-- `POLYMARKET_MAX_SPREAD`
-- `POLYMARKET_MIN_TOP_LIQUIDITY`
-- `POLYMARKET_MIN_EDGE`
-- `POLYMARKET_STALE_AFTER_MS`
+| Variable | Default | What it does |
+|---|---|---|
+| `POLYMARKET_MARKET_LIMIT` | `120` | Max active markets scanned per refresh |
+| `POLYMARKET_CACHE_TTL_MS` | `15000` | Server-side snapshot cache TTL |
+| `POLYMARKET_MAX_SPREAD` | `0.25` | Drop markets with YES or NO spread wider than this |
+| `POLYMARKET_MIN_TOP_LIQUIDITY` | `50` | Minimum size (sets) at dominant-side top of book |
+| `POLYMARKET_MIN_EDGE` | `-0.005` | Noise floor: drop candidates with dominant edge below this |
+| `POLYMARKET_STALE_AFTER_MS` | `120000` | Mark book as stale beyond this age |
 
 ## Deploying to Vercel
 
