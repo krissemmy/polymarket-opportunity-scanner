@@ -5,7 +5,11 @@ import type { Signal, SignalsResponse } from "@/lib/types";
 
 const POLL_INTERVAL_MS = 25_000;
 const THEME_STORAGE_KEY = "polymarket-scanner-theme";
-const POSITIVE_ONLY_STORAGE_KEY = "polymarket-scanner-positive-only";
+const POSITIVE_ONLY_STORAGE_KEY = "polymarket-scanner-positive-only-v2";
+const INCLUDE_LONG_SHOTS_STORAGE_KEY =
+  "polymarket-scanner-include-long-shots-v1";
+const EXTREME_LONG_SHOT_FLOOR = 0.02;
+const EXTREME_LONG_SHOT_CEILING = 0.98;
 
 type ThemeMode = "light" | "dark";
 
@@ -82,6 +86,28 @@ function edgeClassName(edge: number) {
   return "edge";
 }
 
+function isExtremeLongShot(signal: Signal) {
+  const prices = [
+    signal.yes.bestBid,
+    signal.yes.bestAsk,
+    signal.no.bestBid,
+    signal.no.bestAsk,
+  ];
+
+  return prices.some(
+    (price) =>
+      price <= EXTREME_LONG_SHOT_FLOOR || price >= EXTREME_LONG_SHOT_CEILING,
+  );
+}
+
+function getBestPositiveEdge(
+  signals: Signal[],
+  accessor: (signal: Signal) => number,
+) {
+  const positiveEdges = signals.map(accessor).filter((edge) => edge > 0);
+  return positiveEdges.length > 0 ? Math.max(...positiveEdges) : null;
+}
+
 async function fetchSignals(): Promise<SignalsResponse> {
   const response = await fetch("/api/signals", { cache: "no-store" });
 
@@ -95,7 +121,7 @@ async function fetchSignals(): Promise<SignalsResponse> {
   return (await response.json()) as SignalsResponse;
 }
 
-function SignalDetails({ signal }: { signal: Signal }) {
+function SignalDetails({ signal, nowMs }: { signal: Signal; nowMs: number }) {
   return (
     <div className="details-panel">
       <div className="details-grid">
@@ -109,6 +135,29 @@ function SignalDetails({ signal }: { signal: Signal }) {
         </div>
 
         <div className="formula-block">
+          <div className="details-metrics-grid">
+            <div className="details-metric">
+              <span className="details-metric-label">Best edge</span>
+              <span className={edgeClassName(signal.dominantEdge)}>
+                {formatEdge(signal.dominantEdge)}
+              </span>
+            </div>
+            <div className="details-metric">
+              <span className="details-metric-label">Confidence</span>
+              <span>{signal.confidence} · {signal.confidenceScore.toFixed(0)}/100</span>
+            </div>
+            <div className="details-metric">
+              <span className="details-metric-label">Combined spread</span>
+              <span>{formatCents(signal.combinedSpread)}</span>
+            </div>
+            <div className="details-metric">
+              <span className="details-metric-label">Book freshness</span>
+              <span>
+                {formatRelative(signal.lastUpdated, nowMs)} ·{" "}
+                {signal.stale ? "stale" : "fresh"}
+              </span>
+            </div>
+          </div>
           <div className="formula-line">
             <strong>Buy complete set</strong>
             <br />
@@ -143,7 +192,7 @@ function SkeletonRows({ rows = 6 }: { rows?: number }) {
     <>
       {Array.from({ length: rows }).map((_, index) => (
         <tr className="skeleton-row" key={index}>
-          <td colSpan={11}>
+          <td colSpan={7}>
             <span className="skeleton-bar" />
           </td>
         </tr>
@@ -159,7 +208,8 @@ export function SignalsDashboard() {
   const [refreshing, setRefreshing] = useState(false);
   const [expandedSignalId, setExpandedSignalId] = useState<string | null>(null);
   const [theme, setTheme] = useState<ThemeMode>("light");
-  const [positiveOnly, setPositiveOnly] = useState(false);
+  const [positiveOnly, setPositiveOnly] = useState(true);
+  const [includeExtremeLongShots, setIncludeExtremeLongShots] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -174,7 +224,16 @@ export function SignalsDashboard() {
     }
 
     const savedPositiveOnly = window.localStorage.getItem(POSITIVE_ONLY_STORAGE_KEY);
-    if (savedPositiveOnly === "true") setPositiveOnly(true);
+    if (savedPositiveOnly === "true" || savedPositiveOnly === "false") {
+      setPositiveOnly(savedPositiveOnly === "true");
+    }
+
+    const savedIncludeLongShots = window.localStorage.getItem(
+      INCLUDE_LONG_SHOTS_STORAGE_KEY,
+    );
+    if (savedIncludeLongShots === "true" || savedIncludeLongShots === "false") {
+      setIncludeExtremeLongShots(savedIncludeLongShots === "true");
+    }
   }, []);
 
   useEffect(() => {
@@ -188,6 +247,13 @@ export function SignalsDashboard() {
       positiveOnly ? "true" : "false",
     );
   }, [positiveOnly]);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      INCLUDE_LONG_SHOTS_STORAGE_KEY,
+      includeExtremeLongShots ? "true" : "false",
+    );
+  }, [includeExtremeLongShots]);
 
   const loadSignals = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (silent) {
@@ -229,11 +295,35 @@ export function SignalsDashboard() {
   }, []);
 
   const allSignals = data?.signals ?? [];
-  const visibleSignals = useMemo(
-    () => (positiveOnly ? allSignals.filter((s) => s.isOpportunity) : allSignals),
-    [allSignals, positiveOnly],
+  const candidateSignals = useMemo(
+    () =>
+      allSignals.filter(
+        (signal) => includeExtremeLongShots || !isExtremeLongShot(signal),
+      ),
+    [allSignals, includeExtremeLongShots],
   );
-  const hiddenByFilter = allSignals.length - visibleSignals.length;
+  const opportunitySignals = useMemo(
+    () => candidateSignals.filter((signal) => signal.isOpportunity),
+    [candidateSignals],
+  );
+  const nearMissSignals = useMemo(
+    () => candidateSignals.filter((signal) => !signal.isOpportunity),
+    [candidateSignals],
+  );
+  const visibleSignals = useMemo(
+    () => (positiveOnly ? opportunitySignals : candidateSignals),
+    [candidateSignals, opportunitySignals, positiveOnly],
+  );
+  const hiddenNearMissCount = positiveOnly ? nearMissSignals.length : 0;
+  const hiddenLongShotCount = allSignals.length - candidateSignals.length;
+  const bestVisibleBuyEdge = useMemo(
+    () => getBestPositiveEdge(candidateSignals, (signal) => signal.buyCompleteSetEdge),
+    [candidateSignals],
+  );
+  const bestVisibleSellEdge = useMemo(
+    () => getBestPositiveEdge(candidateSignals, (signal) => signal.sellCompleteSetEdge),
+    [candidateSignals],
+  );
   const nextTheme = theme === "light" ? "dark" : "light";
   const servedFromCache = data?.servedFromCache === true;
 
@@ -279,25 +369,23 @@ export function SignalsDashboard() {
         </div>
         <div className="summary-card">
           <div className="summary-label">Opportunities</div>
-          <div className="summary-value">{data?.opportunitiesFound ?? "—"}</div>
-          <div className="summary-note">Markets with a positive dominant edge.</div>
+          <div className="summary-value">
+            {data ? opportunitySignals.length : "—"}
+          </div>
+          <div className="summary-note">Positive dominant edges after filters.</div>
         </div>
         <div className="summary-card">
           <div className="summary-label">Best buy edge</div>
-          <div className="summary-value">
-            {formatEdge(data?.bestBuyEdge ?? null)}
-          </div>
+          <div className="summary-value">{formatEdge(bestVisibleBuyEdge)}</div>
           <div className="summary-note">
-            Largest 1 − (YES ask + NO ask) across the scan.
+            Best positive buy edge after filters.
           </div>
         </div>
         <div className="summary-card">
           <div className="summary-label">Best sell edge</div>
-          <div className="summary-value">
-            {formatEdge(data?.bestSellEdge ?? null)}
-          </div>
+          <div className="summary-value">{formatEdge(bestVisibleSellEdge)}</div>
           <div className="summary-note">
-            Largest (YES bid + NO bid) − 1 across the scan.
+            Best positive sell edge after filters.
           </div>
         </div>
       </section>
@@ -307,8 +395,8 @@ export function SignalsDashboard() {
           <div className="panel-title">
             <h2>Ranked signals</h2>
             <p>
-              Opportunities first, then near-misses. Ranked by dominant edge,
-              then top-of-book depth, then spread tightness.
+              Positive-edge opportunities are shown by default. Near-misses and
+              extreme long-shots are available only when you explicitly opt in.
             </p>
           </div>
           <div className="panel-controls">
@@ -322,6 +410,19 @@ export function SignalsDashboard() {
                 <span className="toggle-thumb" />
               </span>
               <span className="toggle-label">Positive edge only</span>
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={includeExtremeLongShots}
+                onChange={(event) =>
+                  setIncludeExtremeLongShots(event.target.checked)
+                }
+              />
+              <span className="toggle-track" aria-hidden="true">
+                <span className="toggle-thumb" />
+              </span>
+              <span className="toggle-label">Include long-shots</span>
             </label>
             <p className="panel-meta">
               {data
@@ -353,187 +454,209 @@ export function SignalsDashboard() {
 
         {!error && !loading && visibleSignals.length === 0 ? (
           <div className="empty-state">
-            {positiveOnly
-              ? "No positive-edge opportunities right now. Book-tightness alone isn’t an opportunity."
-              : "No candidates passed the current spread and liquidity filters."}
-            {hiddenByFilter > 0 && positiveOnly ? (
+            {positiveOnly ? (
               <>
-                {" "}
-                <button
-                  className="link-button"
-                  onClick={() => setPositiveOnly(false)}
-                  type="button"
-                >
-                  Show {hiddenByFilter} near-miss
-                  {hiddenByFilter === 1 ? "" : "es"}
-                </button>
+                <h3>No positive-edge opportunities right now</h3>
+                <p>
+                  {nearMissSignals.length} near-miss
+                  {nearMissSignals.length === 1 ? "" : "es"} available if you want
+                  to inspect market structure.
+                  {hiddenLongShotCount > 0
+                    ? ` ${hiddenLongShotCount} extreme long-shot market${
+                        hiddenLongShotCount === 1 ? " is" : "s are"
+                      } hidden by default.`
+                    : ""}
+                </p>
+                <div className="empty-state-actions">
+                  {nearMissSignals.length > 0 ? (
+                    <button
+                      className="secondary-button"
+                      onClick={() => setPositiveOnly(false)}
+                      type="button"
+                    >
+                      View near-misses
+                    </button>
+                  ) : null}
+                  {hiddenLongShotCount > 0 && !includeExtremeLongShots ? (
+                    <button
+                      className="link-button"
+                      onClick={() => setIncludeExtremeLongShots(true)}
+                      type="button"
+                    >
+                      Include extreme long-shots
+                    </button>
+                  ) : null}
+                </div>
               </>
-            ) : null}
+            ) : (
+              <>
+                <h3>No candidates passed the current filters</h3>
+                <p>
+                  Try including extreme long-shots or wait for the next refresh.
+                </p>
+                {hiddenLongShotCount > 0 && !includeExtremeLongShots ? (
+                  <button
+                    className="link-button"
+                    onClick={() => setIncludeExtremeLongShots(true)}
+                    type="button"
+                  >
+                    Include extreme long-shots
+                  </button>
+                ) : null}
+              </>
+            )}
           </div>
         ) : null}
 
-        <div className="table-wrap">
-          <table className="signals-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Market</th>
-                <th>YES bid / ask</th>
-                <th>NO bid / ask</th>
-                <th>Buy edge</th>
-                <th>Sell edge</th>
-                <th>Spread</th>
-                <th>Top size</th>
-                <th>Confidence</th>
-                <th>Book</th>
-                <th>Reasoning</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading && !data ? (
-                <SkeletonRows rows={6} />
-              ) : (
-                visibleSignals.map((signal, index) => {
-                  const expanded = expandedSignalId === signal.marketId;
-                  const marketUrl = signal.slug
-                    ? `https://polymarket.com/event/${signal.slug}`
-                    : null;
+        {visibleSignals.length > 0 || (loading && !data) ? (
+          <div className="table-wrap">
+            <table className="signals-table">
+              <thead>
+                <tr>
+                  <th>Market</th>
+                  <th>YES bid / ask</th>
+                  <th>NO bid / ask</th>
+                  <th>Best edge</th>
+                  <th>Liquidity</th>
+                  <th>Freshness</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && !data ? (
+                  <SkeletonRows rows={6} />
+                ) : (
+                  visibleSignals.map((signal, index) => {
+                    const expanded = expandedSignalId === signal.marketId;
+                    const marketUrl = signal.slug
+                      ? `https://polymarket.com/event/${signal.slug}`
+                      : null;
 
-                  return (
-                    <Fragment key={signal.marketId}>
-                      <tr className={signal.isOpportunity ? "row-opportunity" : ""}>
-                        <td className="rank-cell">
-                          <span className="rank-pill">{index + 1}</span>
-                        </td>
-                        <td className="market-cell">
-                          {marketUrl ? (
-                            <a
-                              className="market-question market-link"
-                              href={marketUrl}
-                              target="_blank"
-                              rel="noreferrer noopener"
-                              title="Open on Polymarket"
+                    return (
+                      <Fragment key={signal.marketId}>
+                        <tr className={signal.isOpportunity ? "row-opportunity" : ""}>
+                          <td className="market-cell">
+                            <div className="market-topline">
+                              <span className="rank-pill">{index + 1}</span>
+                              <span className={`signal-badge ${signal.dominantAction}`}>
+                                {signal.isOpportunity
+                                  ? `${signal.dominantAction.toUpperCase()} opportunity`
+                                  : `${signal.dominantAction.toUpperCase()} near-miss`}
+                              </span>
+                            </div>
+                            {marketUrl ? (
+                              <a
+                                className="market-question market-link"
+                                href={marketUrl}
+                                target="_blank"
+                                rel="noreferrer noopener"
+                                title="Open on Polymarket"
+                              >
+                                {signal.question}
+                              </a>
+                            ) : (
+                              <p className="market-question">{signal.question}</p>
+                            )}
+                          </td>
+                          <td>
+                            <div className="quote-pair">
+                              <div className="quote-main">
+                                {formatCents(signal.yes.bestBid)} /{" "}
+                                {formatCents(signal.yes.bestAsk)}
+                              </div>
+                              <div className="quote-subline">
+                                sizes {signal.yes.bestBidSize.toFixed(0)} /{" "}
+                                {signal.yes.bestAskSize.toFixed(0)}
+                              </div>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="quote-pair">
+                              <div className="quote-main">
+                                {formatCents(signal.no.bestBid)} /{" "}
+                                {formatCents(signal.no.bestAsk)}
+                              </div>
+                              <div className="quote-subline">
+                                sizes {signal.no.bestBidSize.toFixed(0)} /{" "}
+                                {signal.no.bestAskSize.toFixed(0)}
+                              </div>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="quote-pair">
+                              <div className={edgeClassName(signal.dominantEdge)}>
+                                {formatEdge(signal.dominantEdge)}
+                              </div>
+                              <div className="quote-subline">
+                                {signal.dominantAction.toUpperCase()} complete set
+                              </div>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="quote-pair">
+                              <div className="metric-strong">
+                                {formatSets(signal.dominantTopLiquidity)} sets
+                              </div>
+                              <div className="quote-subline">top of book</div>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="quote-pair">
+                              <div className="metric-strong">
+                                {formatRelative(signal.lastUpdated, nowMs)}
+                              </div>
+                              <div className="quote-subline">
+                                {signal.stale ? "stale" : "fresh"}
+                              </div>
+                            </div>
+                          </td>
+                          <td>
+                            <button
+                              aria-expanded={expanded}
+                              className="details-button"
+                              onClick={() =>
+                                setExpandedSignalId(expanded ? null : signal.marketId)
+                              }
+                              type="button"
                             >
-                              {signal.question}
-                            </a>
-                          ) : (
-                            <p className="market-question">{signal.question}</p>
-                          )}
-                          <div className="badge-row">
-                            <span className={`signal-badge ${signal.dominantAction}`}>
-                              {signal.isOpportunity
-                                ? `${signal.dominantAction.toUpperCase()} opportunity`
-                                : `${signal.dominantAction.toUpperCase()} near-miss`}
-                            </span>
-                            <span className="tiny-note">
-                              Dominant {formatEdge(signal.dominantEdge)}
-                            </span>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="quote-pair">
-                            <div className="quote-main">
-                              {formatCents(signal.yes.bestBid)} /{" "}
-                              {formatCents(signal.yes.bestAsk)}
-                            </div>
-                            <div className="quote-subline">
-                              {signal.yes.bestBidSize.toFixed(0)} /{" "}
-                              {signal.yes.bestAskSize.toFixed(0)}
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="quote-pair">
-                            <div className="quote-main">
-                              {formatCents(signal.no.bestBid)} /{" "}
-                              {formatCents(signal.no.bestAsk)}
-                            </div>
-                            <div className="quote-subline">
-                              {signal.no.bestBidSize.toFixed(0)} /{" "}
-                              {signal.no.bestAskSize.toFixed(0)}
-                            </div>
-                          </div>
-                        </td>
-                        <td className={edgeClassName(signal.buyCompleteSetEdge)}>
-                          {formatEdge(signal.buyCompleteSetEdge)}
-                        </td>
-                        <td className={edgeClassName(signal.sellCompleteSetEdge)}>
-                          {formatEdge(signal.sellCompleteSetEdge)}
-                        </td>
-                        <td>
-                          <div className="quote-pair">
-                            <div className="metric-strong">
-                              {formatCents(signal.combinedSpread)}
-                            </div>
-                            <div className="quote-subline">
-                              Y {formatCents(signal.yes.spread)} / N{" "}
-                              {formatCents(signal.no.spread)}
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="quote-pair">
-                            <div className="metric-strong">
-                              {formatSets(signal.dominantTopLiquidity)} sets
-                            </div>
-                            <div className="quote-subline">
-                              B {formatSets(signal.buyTopLiquidity)} / S{" "}
-                              {formatSets(signal.sellTopLiquidity)}
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="quote-pair">
-                            <span className={`confidence-badge ${signal.confidence}`}>
-                              {signal.confidence}
-                            </span>
-                            <div className="quote-subline">
-                              {signal.confidenceScore.toFixed(0)}/100
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <div className="quote-pair">
-                            <div className="metric-strong">
-                              {formatRelative(signal.lastUpdated, nowMs)}
-                            </div>
-                            <div className="quote-subline">
-                              {signal.stale ? "stale" : "fresh"}
-                            </div>
-                          </div>
-                        </td>
-                        <td>
-                          <button
-                            aria-expanded={expanded}
-                            className="details-button"
-                            onClick={() =>
-                              setExpandedSignalId(expanded ? null : signal.marketId)
-                            }
-                            type="button"
-                          >
-                            {expanded ? "Hide" : "Show"}
-                          </button>
-                        </td>
-                      </tr>
-                      {expanded ? (
-                        <tr className="details-row">
-                          <td colSpan={11}>
-                            <SignalDetails signal={signal} />
+                              {expanded ? "Hide" : "Show"}
+                            </button>
                           </td>
                         </tr>
-                      ) : null}
-                    </Fragment>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
+                        {expanded ? (
+                          <tr className="details-row">
+                            <td colSpan={7}>
+                              <SignalDetails signal={signal} nowMs={nowMs} />
+                            </td>
+                          </tr>
+                        ) : null}
+                      </Fragment>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
 
-        {!loading && positiveOnly && hiddenByFilter > 0 ? (
+        {!loading && (hiddenNearMissCount > 0 || hiddenLongShotCount > 0) ? (
           <div className="panel-footer">
-            {hiddenByFilter} near-miss{hiddenByFilter === 1 ? "" : "es"} hidden by
-            the positive-edge filter.
+            {hiddenNearMissCount > 0 ? (
+              <>
+                {hiddenNearMissCount} near-miss
+                {hiddenNearMissCount === 1 ? "" : "es"} hidden by the
+                positive-edge filter.
+              </>
+            ) : (
+              <>Positive-edge filter is off.</>
+            )}
+            {hiddenLongShotCount > 0 ? (
+              <>
+                {" "}
+                {hiddenLongShotCount} extreme long-shot market
+                {hiddenLongShotCount === 1 ? "" : "s"} hidden by default.
+              </>
+            ) : null}
           </div>
         ) : null}
       </section>
